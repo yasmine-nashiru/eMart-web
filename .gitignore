@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+venv/
+.streamlit/secrets.toml
+run_app.bat
+phase7_security.sql
