@@ -1,5 +1,5 @@
 """
-Database connection helpers for the Marketplace Streamlit app.
+Database connection helpers for the eMart Streamlit app.
 
 Reads connection settings from environment variables so credentials are
 never hard-coded in source (see Phase 7 security notes):
@@ -71,7 +71,30 @@ def run_action(sql, params=None):
         cursor.close()
 
 
-def call_procedure(name, params=None):
+def run_transaction(fn):
+    """
+    Runs fn(cursor) inside a single atomic database transaction.
+    fn should perform its work via cursor.execute(...) calls and may return
+    a value (e.g. the new Order's ID). Commits only if fn completes without
+    raising; rolls back the ENTIRE transaction on any error, so a failure
+    partway through (e.g. after the Order row but before an OrderDetail row)
+    never leaves a partial/inconsistent record in the database.
+    Returns (success, result_or_error_message).
+    """
+    conn = get_connection()
+    if not conn.is_connected():
+        conn.reconnect()
+    cursor = conn.cursor()
+    try:
+        conn.start_transaction()
+        result = fn(cursor)
+        conn.commit()
+        return True, result
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        cursor.close()
     """Call a Phase 6 stored procedure. Returns list of result sets as DataFrames."""
     conn = get_connection()
     if not conn.is_connected():

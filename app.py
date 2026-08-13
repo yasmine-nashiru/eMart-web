@@ -1,6 +1,6 @@
 """
-E-Commerce Marketplace System — Phase 8 Application
-Streamlit + MariaDB (MarketplaceDB)
+eMart — Phase 8 Application
+Streamlit + MariaDB (database: MarketplaceDB)
 
 Run with:  streamlit run app.py
 """
@@ -8,7 +8,7 @@ Run with:  streamlit run app.py
 import streamlit as st
 import pandas as pd
 
-from db import run_query, run_action
+from db import run_query, run_action, run_transaction
 from auth import authenticate, hash_password
 from validators import (
     validate_email, validate_phone, validate_password,
@@ -16,6 +16,46 @@ from validators import (
 )
 
 st.set_page_config(page_title="eMart Admin", layout="wide")
+
+# Custom styling on top of .streamlit/config.toml (which sets the base
+# background/sidebar/text/primary-button colors). This covers what the
+# theme config can't: hover states and small text highlights.
+st.markdown(
+    """
+    <style>
+    /* Primary + form + download buttons: sky blue, soft pink on hover */
+    div.stButton > button,
+    div.stFormSubmitButton > button,
+    div.stDownloadButton > button {
+        background-color: #38BDF8;
+        color: #FFFFFF;
+        border: 1px solid #38BDF8;
+        border-radius: 6px;
+        font-weight: 600;
+        transition: background-color 0.15s ease, border-color 0.15s ease;
+    }
+    div.stButton > button:hover,
+    div.stFormSubmitButton > button:hover,
+    div.stDownloadButton > button:hover {
+        background-color: #F9A8D4;
+        border-color: #F9A8D4;
+        color: #1B2A41;
+    }
+    /* Sidebar acts as the navbar */
+    [data-testid="stSidebar"] {
+        background-color: #FFFFFF;
+        border-right: 1px solid #E5EEF7;
+    }
+    /* Small highlights: captions, metric labels/deltas */
+    [data-testid="stCaptionContainer"],
+    [data-testid="stMetricDelta"],
+    small {
+        color: #EC4899 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ------------------------------------------------------------------
 # Session state / auth
@@ -52,6 +92,52 @@ def login_page():
             "tables. To create a Staff/Admin account, insert a row with a "
             "bcrypt-hashed password (see `scripts/create_admin.py`)."
         )
+
+    if login_as == "Customer":
+        with st.expander("New here? Create a customer account"):
+            signup_customer()
+
+
+def signup_customer():
+    with st.form("signup_form"):
+        col1, col2 = st.columns(2)
+        first = col1.text_input("First name")
+        last = col2.text_input("Last name")
+        email = st.text_input("Email", key="signup_email")
+        phone = st.text_input("Phone number (e.g. 0244123456)")
+        pwd = st.text_input("Password", type="password", key="signup_pwd")
+        pwd2 = st.text_input("Confirm password", type="password")
+        submitted = st.form_submit_button("Create Account")
+
+    if not submitted:
+        return
+
+    checks = [
+        validate_non_empty(first, "First name"),
+        validate_non_empty(last, "Last name"),
+        validate_email(email),
+        validate_phone(phone),
+        validate_password(pwd),
+    ]
+    if pwd != pwd2:
+        checks.append((False, "Passwords do not match."))
+    if not form_errors(*checks):
+        return
+
+    existing = run_query("SELECT CustomerID FROM Customer WHERE Email = %s", (email,))
+    if not existing.empty:
+        st.error("An account with this email already exists — try signing in instead.")
+        return
+
+    ok, res = run_action(
+        "INSERT INTO Customer (FirstName, LastName, Email, PhoneNumber, Password, RegistrationDate) "
+        "VALUES (%s, %s, %s, %s, %s, CURDATE())",
+        (first, last, email, phone, hash_password(pwd)),
+    )
+    if ok:
+        st.success("Account created! Select 'Customer' above and sign in with your new email and password.")
+    else:
+        st.error(f"Could not create account: {res}")
 
 
 # ------------------------------------------------------------------
@@ -123,6 +209,37 @@ def page_catalog():
 # ------------------------------------------------------------------
 # CUSTOMER — cart, orders, reviews
 # ------------------------------------------------------------------
+def page_my_profile():
+    require_role("Customer")
+    cust_id = st.session_state.user["id"]
+    st.header("My Profile")
+    row = run_query("SELECT * FROM Customer WHERE CustomerID = %s", (cust_id,)).iloc[0]
+
+    with st.form("profile_form"):
+        phone = st.text_input("Phone number", value=row.PhoneNumber or "")
+        email = st.text_input("Email", value=row.Email)
+        submitted = st.form_submit_button("Save Changes")
+
+    if submitted:
+        checks = [validate_email(email), validate_phone(phone)]
+        if not form_errors(*checks):
+            return
+        if email != row.Email:
+            dup = run_query("SELECT CustomerID FROM Customer WHERE Email=%s AND CustomerID<>%s", (email, cust_id))
+            if not dup.empty:
+                st.error("Another account already uses that email.")
+                return
+        ok, res = run_action(
+            "UPDATE Customer SET PhoneNumber=%s, Email=%s WHERE CustomerID=%s",
+            (phone, email, cust_id),
+        )
+        if ok:
+            st.session_state.user["email"] = email
+            st.success("Profile updated.")
+        else:
+            st.error(f"Could not update profile: {res}")
+
+
 def page_my_cart():
     require_role("Customer")
     cust_id = st.session_state.user["id"]
@@ -157,28 +274,35 @@ def page_my_cart():
         if not chosen:
             st.error("Select at least one product.")
             return
-        ok_id, order_id = run_action(
-            "INSERT INTO `Order` (CustomerID, OrderDate, OrderStatus, TotalAmount) "
-            "VALUES (%s, NOW(), 'PENDING', 0)",
-            (cust_id,),
-        )
-        if not ok_id:
-            st.error(f"Could not create order: {order_id}")
-            return
-        total = 0.0
-        for pid in chosen:
-            price = float(products.loc[products.ProductID == pid, "UnitPrice"].values[0])
-            qty = qtys[pid]
-            subtotal = price * qty
-            total += subtotal
-            run_action(
-                "INSERT INTO OrderDetail (OrderID, ProductID, Quantity, UnitPrice, Subtotal) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (order_id, pid, qty, price, subtotal),
+
+        def place_order(cursor):
+            cursor.execute(
+                "INSERT INTO `Order` (CustomerID, OrderDate, OrderStatus, TotalAmount) "
+                "VALUES (%s, NOW(), 'PENDING', 0)",
+                (cust_id,),
             )
-        run_action("UPDATE `Order` SET TotalAmount = %s WHERE OrderID = %s", (total, order_id))
-        st.success(f"Order #{order_id} placed — total GHS {total:,.2f}")
-        st.rerun()
+            order_id = cursor.lastrowid
+            total = 0.0
+            for pid in chosen:
+                price = float(products.loc[products.ProductID == pid, "UnitPrice"].values[0])
+                qty = qtys[pid]
+                subtotal = price * qty
+                total += subtotal
+                cursor.execute(
+                    "INSERT INTO OrderDetail (OrderID, ProductID, Quantity, UnitPrice, Subtotal) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (order_id, pid, qty, price, subtotal),
+                )
+            cursor.execute("UPDATE `Order` SET TotalAmount = %s WHERE OrderID = %s", (total, order_id))
+            return order_id, total
+
+        ok, result = run_transaction(place_order)
+        if ok:
+            order_id, total = result
+            st.success(f"Order #{order_id} placed — total GHS {total:,.2f}")
+            st.rerun()
+        else:
+            st.error(f"Order could not be placed — nothing was saved (transaction rolled back): {result}")
 
 
 def page_my_orders():
@@ -614,6 +738,7 @@ PAGES_BY_ROLE = {
         "My Cart / Place Order": page_my_cart,
         "My Orders": page_my_orders,
         "My Reviews": page_my_reviews,
+        "My Profile": page_my_profile,
     },
     "Vendor": {
         "Catalog": page_catalog,
@@ -652,7 +777,7 @@ def main():
         return
 
     user = st.session_state.user
-    st.sidebar.title("🛒 eMArt")
+    st.sidebar.title("🛒 eMart")
     st.sidebar.write(f"**{user['name']}**")
     st.sidebar.caption(f"Role: {user['role']}")
     if st.sidebar.button("Log out"):
